@@ -12,11 +12,11 @@ import (
 	"github.com/influxdata/flux/execute"
 	"github.com/influxdata/flux/lang"
 	"github.com/influxdata/flux/memory"
+	"github.com/influxdata/flux/runtime"
 	"github.com/influxdata/flux/values"
 	"github.com/influxdata/influxdb/v2"
-	"github.com/influxdata/influxdb/v2/kv"
 	"github.com/influxdata/influxdb/v2/query"
-	_ "github.com/influxdata/influxdb/v2/query/builtin"
+	_ "github.com/influxdata/influxdb/v2/fluxinit/static"
 )
 
 type fakeQueryService struct {
@@ -31,7 +31,7 @@ type fakeQueryService struct {
 var _ query.AsyncQueryService = (*fakeQueryService)(nil)
 
 func makeAST(q string) lang.ASTCompiler {
-	pkg, err := flux.Parse(q)
+	pkg, err := runtime.ParseToJSON(q)
 	if err != nil {
 		panic(err)
 	}
@@ -170,10 +170,11 @@ type fakeQuery struct {
 
 var _ flux.Query = (*fakeQuery)(nil)
 
-func (q *fakeQuery) Done()                       {}
-func (q *fakeQuery) Cancel()                     { close(q.results) }
-func (q *fakeQuery) Statistics() flux.Statistics { return flux.Statistics{} }
-func (q *fakeQuery) Results() <-chan flux.Result { return q.results }
+func (q *fakeQuery) Done()                                         {}
+func (q *fakeQuery) Cancel()                                       { close(q.results) }
+func (q *fakeQuery) Statistics() flux.Statistics                   { return flux.Statistics{} }
+func (q *fakeQuery) Results() <-chan flux.Result                   { return q.results }
+func (q *fakeQuery) ProfilerResults() (flux.ResultIterator, error) { return nil, nil }
 
 func (q *fakeQuery) Err() error {
 	if q.ctxErr != nil {
@@ -253,16 +254,16 @@ type testCreds struct {
 	Auth          *influxdb.Authorization
 }
 
-func createCreds(t *testing.T, i *kv.Service) testCreds {
+func createCreds(t *testing.T, orgSvc influxdb.OrganizationService, userSvc influxdb.UserService, authSvc influxdb.AuthorizationService) testCreds {
 	t.Helper()
 
 	org := &influxdb.Organization{Name: t.Name() + "-org"}
-	if err := i.CreateOrganization(context.Background(), org); err != nil {
+	if err := orgSvc.CreateOrganization(context.Background(), org); err != nil {
 		t.Fatal(err)
 	}
 
 	user := &influxdb.User{Name: t.Name() + "-user"}
-	if err := i.CreateUser(context.Background(), user); err != nil {
+	if err := userSvc.CreateUser(context.Background(), user); err != nil {
 		t.Fatal(err)
 	}
 
@@ -280,7 +281,7 @@ func createCreds(t *testing.T, i *kv.Service) testCreds {
 		Token:       "hifriend!",
 		Permissions: []influxdb.Permission{*readPerm, *writePerm},
 	}
-	if err := i.CreateAuthorization(context.Background(), auth); err != nil {
+	if err := authSvc.CreateAuthorization(context.Background(), auth); err != nil {
 		t.Fatal(err)
 	}
 

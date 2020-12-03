@@ -19,7 +19,7 @@ import (
 	platform "github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/mock"
 	"github.com/influxdata/influxdb/v2/query"
-	_ "github.com/influxdata/influxdb/v2/query/builtin"
+	_ "github.com/influxdata/influxdb/v2/fluxinit/static"
 	"github.com/influxdata/influxdb/v2/query/influxql"
 	"github.com/influxdata/influxdb/v2/query/querytest"
 	platformtesting "github.com/influxdata/influxdb/v2/testing"
@@ -131,6 +131,8 @@ var skipTests = map[string]string{
 	"SelectorMath_29":          "Transpiler: unimplemented functions: top and bottom https://github.com/influxdata/influxdb/issues/10738",
 	"SelectorMath_30":          "Transpiler: unimplemented functions: top and bottom https://github.com/influxdata/influxdb/issues/10738",
 	"SelectorMath_31":          "Transpiler: unimplemented functions: top and bottom https://github.com/influxdata/influxdb/issues/10738",
+	"ands":                     "algo-w: https://github.com/influxdata/influxdb/issues/16811",
+	"ors":                      "algo-w: https://github.com/influxdata/influxdb/issues/16811",
 }
 
 var querier = fluxquerytest.NewQuerier()

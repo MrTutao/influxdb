@@ -12,12 +12,12 @@ import (
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/authorization"
 	icontext "github.com/influxdata/influxdb/v2/context"
+	_ "github.com/influxdata/influxdb/v2/fluxinit/static"
 	"github.com/influxdata/influxdb/v2/inmem"
 	"github.com/influxdata/influxdb/v2/kv"
 	"github.com/influxdata/influxdb/v2/kv/migration/all"
 	"github.com/influxdata/influxdb/v2/mock"
 	"github.com/influxdata/influxdb/v2/query"
-	_ "github.com/influxdata/influxdb/v2/query/builtin"
 	"github.com/influxdata/influxdb/v2/query/control"
 	"github.com/influxdata/influxdb/v2/query/fluxlang"
 	stdlib "github.com/influxdata/influxdb/v2/query/stdlib/influxdata/influxdb"
@@ -44,16 +44,16 @@ func TestAnalyticalStore(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			svc := kv.NewService(logger, store, kv.ServiceConfig{
-				FluxLanguageService: fluxlang.DefaultService,
-			})
-
 			tenantStore := tenant.NewStore(store)
 			ts := tenant.NewService(tenantStore)
 
 			authStore, err := authorization.NewStore(store)
 			require.NoError(t, err)
 			authSvc := authorization.NewService(authStore, ts)
+
+			svc := kv.NewService(logger, store, ts, kv.ServiceConfig{
+				FluxLanguageService: fluxlang.DefaultService,
+			})
 
 			metaClient := meta.NewClient(meta.NewConfig(), store)
 			require.NoError(t, metaClient.Open())
@@ -64,26 +64,25 @@ func TestAnalyticalStore(t *testing.T) {
 				svcStack = backend.NewAnalyticalRunStorage(logger, svc, ts.BucketService, svc, rr, ab.QueryService())
 			)
 
-			ts.BucketService = storage.NewBucketService(ts.BucketService, ab.storageEngine)
-
-			go func() {
-				<-ctx.Done()
-				ab.Close(t)
-			}()
+			ts.BucketService = storage.NewBucketService(logger, ts.BucketService, ab.storageEngine)
 
 			authCtx := icontext.SetAuthorizer(ctx, &influxdb.Authorization{
 				Permissions: influxdb.OperPermissions(),
 			})
 
 			return &servicetest.System{
-				TaskControlService:         svcStack,
-				TaskService:                svcStack,
-				OrganizationService:        ts.OrganizationService,
-				UserService:                ts.UserService,
-				UserResourceMappingService: ts.UserResourceMappingService,
-				AuthorizationService:       authSvc,
-				Ctx:                        authCtx,
-			}, cancelFunc
+					TaskControlService:         svcStack,
+					TaskService:                svcStack,
+					OrganizationService:        ts.OrganizationService,
+					UserService:                ts.UserService,
+					UserResourceMappingService: ts.UserResourceMappingService,
+					AuthorizationService:       authSvc,
+					Ctx:                        authCtx,
+					CallFinishRun:              true,
+				}, func() {
+					cancelFunc()
+					ab.Close(t)
+				}
 		},
 	)
 }
@@ -104,7 +103,7 @@ func TestDeduplicateRuns(t *testing.T) {
 	metaClient := meta.NewClient(meta.NewConfig(), store)
 	require.NoError(t, metaClient.Open())
 
-	_, err := metaClient.CreateDatabase(influxdb.TasksSystemBucketID.String())
+	_, err := metaClient.CreateDatabase(influxdb.ID(10).String())
 	require.NoError(t, err)
 
 	ab := newAnalyticalBackend(t, ts.OrganizationService, ts.BucketService, metaClient)

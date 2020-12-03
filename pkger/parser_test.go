@@ -904,40 +904,42 @@ spec:
 `,
 					},
 				},
-				{
-					kind: KindCheckDeadman,
-					resErr: testTemplateResourceError{
-						name:           "duplicate meta name and spec name",
-						validationErrs: 1,
-						valFields:      []string{fieldSpec, fieldAssociations},
-						templateStr: `
-apiVersion: influxdata.com/v2alpha1
-kind: CheckDeadman
-metadata:
-  name: check-1
-spec:
-  every: 5m
-  level: cRiT
-  query:  >
-    from(bucket: "rucket_1") |> yield(name: "mean")
-  statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
-  timeSince: 90s
----
-apiVersion: influxdata.com/v2alpha1
-kind: CheckDeadman
-metadata:
-  name: valid-name
-spec:
-  name: check-1
-  every: 5m
-  level: cRiT
-  query:  >
-    from(bucket: "rucket_1") |> yield(name: "mean")
-  statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
-  timeSince: 90s
-`,
-					},
-				},
+				/* checks are not name unique
+							{
+								kind: KindCheckDeadman,
+								resErr: testTemplateResourceError{
+									name:           "duplicate meta name and spec name",
+									validationErrs: 1,
+									valFields:      []string{fieldSpec, fieldAssociations},
+									templateStr: `
+				apiVersion: influxdata.com/v2alpha1
+				kind: CheckDeadman
+				metadata:
+					name: check-1
+				spec:
+					every: 5m
+					level: cRiT
+					query:  >
+						from(bucket: "rucket_1") |> yield(name: "mean")
+					statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
+					timeSince: 90s
+				---
+				apiVersion: influxdata.com/v2alpha1
+				kind: CheckDeadman
+				metadata:
+					name: valid-name
+				spec:
+					name: check-1
+					every: 5m
+					level: cRiT
+					query:  >
+						from(bucket: "rucket_1") |> yield(name: "mean")
+					statusMessageTemplate: "Check: ${ r._check_name } is: ${ r._level }"
+					timeSince: 90s
+				`,
+								},
+							},
+				*/
 			}
 
 			for _, tt := range tests {
@@ -1056,6 +1058,17 @@ spec:
 						assert.Equal(t, "heatmap", props.GetType())
 						assert.Equal(t, "heatmap note", props.Note)
 						assert.Equal(t, int32(10), props.BinSize)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, []string{"yTotalTicks", "yTickStart", "yTickStep"}, props.GenerateYAxisTicks)
+						assert.Equal(t, 10, props.YTotalTicks)
+						assert.Equal(t, 0.0, props.YTickStart)
+						assert.Equal(t, 100.0, props.YTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 						assert.True(t, props.ShowNoteWhenEmpty)
 
 						assert.Equal(t, []float64{0, 10}, props.XDomain)
@@ -1173,6 +1186,9 @@ spec:
 						assert.Equal(t, "histogram", props.GetType())
 						assert.Equal(t, "histogram note", props.Note)
 						assert.Equal(t, 30, props.BinCount)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 						assert.True(t, props.ShowNoteWhenEmpty)
 						assert.Equal(t, []float64{0, 10}, props.XDomain)
 						assert.Equal(t, []string{"a", "b"}, props.FillColumns)
@@ -1287,6 +1303,13 @@ spec:
 						assert.Equal(t, "y_prefix", props.YPrefix)
 						assert.Equal(t, "x_suffix", props.XSuffix)
 						assert.Equal(t, "y_suffix", props.YSuffix)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 					})
 				})
 			})
@@ -1315,7 +1338,19 @@ spec:
 						assert.True(t, props.ShowNoteWhenEmpty)
 						assert.Equal(t, "y", props.HoverDimension)
 						assert.Equal(t, "foo", props.UpperColumn)
+						assert.Equal(t, "baz", props.MainColumn)
 						assert.Equal(t, "bar", props.LowerColumn)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, []string{"yTotalTicks", "yTickStart", "yTickStep"}, props.GenerateYAxisTicks)
+						assert.Equal(t, 10, props.YTotalTicks)
+						assert.Equal(t, 0.0, props.YTickStart)
+						assert.Equal(t, 100.0, props.YTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 
 						require.Len(t, props.ViewColors, 1)
 						c := props.ViewColors[0]
@@ -1379,6 +1414,17 @@ spec:
 						assert.Equal(t, "y_prefix", props.YPrefix)
 						assert.Equal(t, "x_suffix", props.XSuffix)
 						assert.Equal(t, "y_suffix", props.YSuffix)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, []string{"yTotalTicks", "yTickStart", "yTickStep"}, props.GenerateYAxisTicks)
+						assert.Equal(t, 10, props.YTotalTicks)
+						assert.Equal(t, 0.0, props.YTickStart)
+						assert.Equal(t, 100.0, props.YTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 					})
 				})
 
@@ -1817,6 +1863,17 @@ spec:
 						assert.Equal(t, "overlaid", props.Position)
 						assert.Equal(t, "leg_type", props.Legend.Type)
 						assert.Equal(t, "horizontal", props.Legend.Orientation)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, []string{"yTotalTicks", "yTickStart", "yTickStep"}, props.GenerateYAxisTicks)
+						assert.Equal(t, 10, props.YTotalTicks)
+						assert.Equal(t, 0.0, props.YTickStart)
+						assert.Equal(t, 100.0, props.YTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 
 						require.Len(t, props.Queries, 1)
 						q := props.Queries[0]
@@ -1836,12 +1893,14 @@ spec:
 
 						require.Len(t, props.ViewColors, 2)
 						c := props.ViewColors[0]
+						assert.Equal(t, "base", c.ID)
 						assert.Equal(t, "laser", c.Name)
 						assert.Equal(t, "text", c.Type)
 						assert.Equal(t, "#8F8AF4", c.Hex)
 						assert.Equal(t, 3.0, c.Value)
 
 						c = props.ViewColors[1]
+						assert.Equal(t, "base", c.ID)
 						assert.Equal(t, "android", c.Name)
 						assert.Equal(t, "scale", c.Type)
 						assert.Equal(t, "#F4CF31", c.Hex)
@@ -2271,6 +2330,17 @@ spec:
 						assert.Equal(t, "xy chart note", props.Note)
 						assert.True(t, props.ShowNoteWhenEmpty)
 						assert.Equal(t, "stacked", props.Position)
+						assert.Equal(t, []string{"xTotalTicks", "xTickStart", "xTickStep"}, props.GenerateXAxisTicks)
+						assert.Equal(t, 15, props.XTotalTicks)
+						assert.Equal(t, 0.0, props.XTickStart)
+						assert.Equal(t, 1000.0, props.XTickStep)
+						assert.Equal(t, []string{"yTotalTicks", "yTickStart", "yTickStep"}, props.GenerateYAxisTicks)
+						assert.Equal(t, 10, props.YTotalTicks)
+						assert.Equal(t, 0.0, props.YTickStart)
+						assert.Equal(t, 100.0, props.YTickStep)
+						assert.Equal(t, true, props.LegendColorizeRows)
+						assert.Equal(t, 1.0, props.LegendOpacity)
+						assert.Equal(t, 5, props.LegendOrientationThreshold)
 
 						require.Len(t, props.Queries, 1)
 						q := props.Queries[0]
@@ -2414,7 +2484,7 @@ spec:
 }
 
 from(bucket: params.bucket)
-	|> range(start: params.start, end: params.stop)
+	|> range(start: params.start, stop: params.stop)
 	|> filter(fn: (r) =>
 		(r._measurement == "processes"))
 	|> filter(fn: (r) =>
@@ -3390,7 +3460,7 @@ spec:
 
 				task1 := tasks[1]
 				baseEqual(t, 0, influxdb.Inactive, task1)
-				assert.Equal(t, (10 * time.Minute).String(), task1.Every)
+				assert.Equal(t, (25 * time.Hour).String(), task1.Every)
 				assert.Equal(t, (15 * time.Second).String(), task1.Offset)
 			})
 		})
@@ -3414,7 +3484,7 @@ spec:
 }
 
 from(bucket: params.bucket)
-	|> range(start: params.start, end: params.stop)
+	|> range(start: params.start, stop: params.stop)
 	|> filter(fn: (r) =>
 		(r._measurement == "processes"))
 	|> filter(fn: (r) =>
@@ -4670,7 +4740,7 @@ func testTemplateErrors(t *testing.T, k Kind, tt testTemplateResourceError) {
 
 		defer func() {
 			if t.Failed() {
-				t.Logf("recieved unexpected err: %s", pErr)
+				t.Logf("received unexpected err: %s", pErr)
 			}
 		}()
 

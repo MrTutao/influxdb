@@ -65,13 +65,13 @@ func (e *StatementExecutor) ExecuteStatement(ctx context.Context, stmt influxql.
 	case *influxql.CreateUserStatement:
 		err = iql.ErrNotImplemented("CREATE USER")
 	case *influxql.DeleteSeriesStatement:
-		err = iql.ErrNotImplemented("DROP SERIES")
+		return e.executeDeleteSeriesStatement(ctx, stmt, ectx.Database, ectx)
 	case *influxql.DropContinuousQueryStatement:
 		err = iql.ErrNotImplemented("DROP CONTINUOUS QUERY")
 	case *influxql.DropDatabaseStatement:
 		err = iql.ErrNotImplemented("DROP DATABASE")
 	case *influxql.DropMeasurementStatement:
-		err = iql.ErrNotImplemented("DROP MEASUREMENT")
+		return e.executeDropMeasurementStatement(ctx, stmt, ectx.Database, ectx)
 	case *influxql.DropSeriesStatement:
 		err = iql.ErrNotImplemented("DROP SERIES")
 	case *influxql.DropRetentionPolicyStatement:
@@ -203,11 +203,8 @@ func (e *StatementExecutor) executeExplainAnalyzeStatement(ctx context.Context, 
 			goto CLEANUP
 		} else if row == nil {
 			// Check if the query was interrupted while emitting.
-			select {
-			case <-ctx.Done():
-				err = ctx.Err()
+			if err = ctx.Err(); err != nil {
 				goto CLEANUP
-			default:
 			}
 			break
 		}
@@ -266,10 +263,8 @@ func (e *StatementExecutor) executeSelectStatement(ctx context.Context, stmt *in
 			return err
 		} else if row == nil {
 			// Check if the query was interrupted while emitting.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			break
 		}
@@ -322,14 +317,19 @@ func (e *StatementExecutor) createIterators(ctx context.Context, stmt *influxql.
 
 func (e *StatementExecutor) executeShowDatabasesStatement(ctx context.Context, q *influxql.ShowDatabasesStatement, ectx *query.ExecutionContext) (models.Rows, error) {
 	row := &models.Row{Name: "databases", Columns: []string{"name"}}
-	// TODO(gianarb): How pagination works here?
 	dbrps, _, err := e.DBRP.FindMany(ctx, influxdb.DBRPMappingFilterV2{
 		OrgID: &ectx.OrgID,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	seenDbs := make(map[string]struct{}, len(dbrps))
 	for _, dbrp := range dbrps {
+		if _, ok := seenDbs[dbrp.Database]; ok {
+			continue
+		}
+
 		perm, err := influxdb.NewPermissionAtID(dbrp.BucketID, influxdb.ReadAction, influxdb.BucketsResourceType, dbrp.OrganizationID)
 		if err != nil {
 			return nil, err
@@ -341,6 +341,7 @@ func (e *StatementExecutor) executeShowDatabasesStatement(ctx context.Context, q
 			}
 			return nil, err
 		}
+		seenDbs[dbrp.Database] = struct{}{}
 		row.Values = append(row.Values, []interface{}{dbrp.Database})
 	}
 	return []*models.Row{row}, nil
@@ -361,6 +362,26 @@ func (e *StatementExecutor) getDefaultRP(ctx context.Context, database string, e
 		return nil, fmt.Errorf("finding DBRP mappings: expected 1, found %d", n)
 	}
 	return mappings[0], nil
+}
+
+func (e *StatementExecutor) executeDeleteSeriesStatement(ctx context.Context, q *influxql.DeleteSeriesStatement, database string, ectx *query.ExecutionContext) error {
+	mapping, err := e.getDefaultRP(ctx, database, ectx)
+	if err != nil {
+		return err
+	}
+
+	// Convert "now()" to current time.
+	q.Condition = influxql.Reduce(q.Condition, &influxql.NowValuer{Now: time.Now().UTC()})
+
+	return e.TSDBStore.DeleteSeries(mapping.BucketID.String(), q.Sources, q.Condition)
+}
+
+func (e *StatementExecutor) executeDropMeasurementStatement(ctx context.Context, q *influxql.DropMeasurementStatement, database string, ectx *query.ExecutionContext) error {
+	mapping, err := e.getDefaultRP(ctx, database, ectx)
+	if err != nil {
+		return err
+	}
+	return e.TSDBStore.DeleteMeasurement(mapping.BucketID.String(), q.Name)
 }
 
 func (e *StatementExecutor) executeShowMeasurementsStatement(ctx context.Context, q *influxql.ShowMeasurementsStatement, ectx *query.ExecutionContext) error {
@@ -734,6 +755,8 @@ func (m mappings) DefaultRetentionPolicy(db string) string {
 
 // TSDBStore is an interface for accessing the time series data store.
 type TSDBStore interface {
+	DeleteMeasurement(database, name string) error
+	DeleteSeries(database string, sources []influxql.Source, condition influxql.Expr) error
 	MeasurementNames(auth query.Authorizer, database string, cond influxql.Expr) ([][]byte, error)
 	TagKeys(auth query.Authorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagKeys, error)
 	TagValues(auth query.Authorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagValues, error)

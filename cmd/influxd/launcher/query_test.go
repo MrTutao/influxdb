@@ -19,7 +19,10 @@ import (
 	"github.com/influxdata/flux/csv"
 	"github.com/influxdata/flux/execute"
 	"github.com/influxdata/flux/execute/executetest"
+	"github.com/influxdata/flux/execute/table"
 	"github.com/influxdata/flux/lang"
+	"github.com/influxdata/flux/memory"
+	"github.com/influxdata/flux/runtime"
 	"github.com/influxdata/flux/values"
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/cmd/influxd/launcher"
@@ -27,8 +30,8 @@ import (
 	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/prom"
 	"github.com/influxdata/influxdb/v2/mock"
-	"github.com/influxdata/influxdb/v2/pkg/flux/execute/table"
 	"github.com/influxdata/influxdb/v2/query"
+	"go.uber.org/zap"
 )
 
 func TestLauncher_Write_Query_FieldKey(t *testing.T) {
@@ -221,7 +224,7 @@ func queryPoints(ctx context.Context, t *testing.T, l *launcher.TestLauncher, op
 	if d.verbose {
 		t.Logf("query:\n%s", qs)
 	}
-	pkg, err := flux.Parse(qs)
+	pkg, err := runtime.ParseToJSON(qs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +246,7 @@ func queryPoints(ctx context.Context, t *testing.T, l *launcher.TestLauncher, op
 func TestLauncher_QueryMemoryLimits(t *testing.T) {
 	tcs := []struct {
 		name           string
-		args           []string
+		setOpts        launcher.OptSetter
 		err            bool
 		querySizeBytes int
 		// max_memory - per_query_memory * concurrency
@@ -251,10 +254,10 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 	}{
 		{
 			name: "ok - initial memory bytes, memory bytes, and max memory set",
-			args: []string{
-				"--query-concurrency", "1",
-				"--query-initial-memory-bytes", "100",
-				"--query-max-memory-bytes", "1048576", // 1MB
+			setOpts: func(o *launcher.InfluxdOpts) {
+				o.ConcurrencyQuota = 1
+				o.InitialMemoryBytesQuotaPerQuery = 100
+				o.MaxMemoryBytes = 1048576 // 1MB
 			},
 			querySizeBytes:    30000,
 			err:               false,
@@ -262,10 +265,10 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 		},
 		{
 			name: "error - memory bytes and max memory set",
-			args: []string{
-				"--query-concurrency", "1",
-				"--query-memory-bytes", "1",
-				"--query-max-memory-bytes", "100",
+			setOpts: func(o *launcher.InfluxdOpts) {
+				o.ConcurrencyQuota = 1
+				o.MemoryBytesQuotaPerQuery = 1
+				o.MaxMemoryBytes = 100
 			},
 			querySizeBytes:    2,
 			err:               true,
@@ -273,10 +276,10 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 		},
 		{
 			name: "error - initial memory bytes and max memory set",
-			args: []string{
-				"--query-concurrency", "1",
-				"--query-initial-memory-bytes", "1",
-				"--query-max-memory-bytes", "100",
+			setOpts: func(o *launcher.InfluxdOpts) {
+				o.ConcurrencyQuota = 1
+				o.InitialMemoryBytesQuotaPerQuery = 1
+				o.MaxMemoryBytes = 100
 			},
 			querySizeBytes:    101,
 			err:               true,
@@ -284,11 +287,11 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 		},
 		{
 			name: "error - initial memory bytes, memory bytes, and max memory set",
-			args: []string{
-				"--query-concurrency", "1",
-				"--query-initial-memory-bytes", "1",
-				"--query-memory-bytes", "50",
-				"--query-max-memory-bytes", "100",
+			setOpts: func(o *launcher.InfluxdOpts) {
+				o.ConcurrencyQuota = 1
+				o.InitialMemoryBytesQuotaPerQuery = 1
+				o.MemoryBytesQuotaPerQuery = 50
+				o.MaxMemoryBytes = 100
 			},
 			querySizeBytes:    51,
 			err:               true,
@@ -298,7 +301,7 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			l := launcher.RunTestLauncherOrFail(t, ctx, nil, tc.args...)
+			l := launcher.RunTestLauncherOrFail(t, ctx, nil, tc.setOpts)
 			l.SetupOrFail(t)
 			defer l.ShutdownOrFail(t, ctx)
 
@@ -336,13 +339,13 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 func TestLauncher_QueryMemoryManager_ExceedMemory(t *testing.T) {
 	t.Skip("this test is flaky, occasionally get error: \"memory allocation limit reached\" on OK query")
 
-	l := launcher.RunTestLauncherOrFail(t, ctx, nil,
-		"--log-level", "error",
-		"--query-concurrency", "1",
-		"--query-initial-memory-bytes", "100",
-		"--query-memory-bytes", "50000",
-		"--query-max-memory-bytes", "200000",
-	)
+	l := launcher.RunTestLauncherOrFail(t, ctx, nil, func(o *launcher.InfluxdOpts) {
+		o.LogLevel = zap.ErrorLevel
+		o.ConcurrencyQuota = 1
+		o.InitialMemoryBytesQuotaPerQuery = 100
+		o.MemoryBytesQuotaPerQuery = 50000
+		o.MaxMemoryBytes = 200000
+	})
 	l.SetupOrFail(t)
 	defer l.ShutdownOrFail(t, ctx)
 
@@ -381,13 +384,13 @@ func TestLauncher_QueryMemoryManager_ExceedMemory(t *testing.T) {
 func TestLauncher_QueryMemoryManager_ContextCanceled(t *testing.T) {
 	t.Skip("this test is flaky, occasionally get error: \"memory allocation limit reached\"")
 
-	l := launcher.RunTestLauncherOrFail(t, ctx, nil,
-		"--log-level", "error",
-		"--query-concurrency", "1",
-		"--query-initial-memory-bytes", "100",
-		"--query-memory-bytes", "50000",
-		"--query-max-memory-bytes", "200000",
-	)
+	l := launcher.RunTestLauncherOrFail(t, ctx, nil, func(o *launcher.InfluxdOpts) {
+		o.LogLevel = zap.ErrorLevel
+		o.ConcurrencyQuota = 1
+		o.InitialMemoryBytesQuotaPerQuery = 100
+		o.MemoryBytesQuotaPerQuery = 50000
+		o.MaxMemoryBytes = 200000
+	})
 	l.SetupOrFail(t)
 	defer l.ShutdownOrFail(t, ctx)
 
@@ -425,14 +428,14 @@ func TestLauncher_QueryMemoryManager_ContextCanceled(t *testing.T) {
 func TestLauncher_QueryMemoryManager_ConcurrentQueries(t *testing.T) {
 	t.Skip("this test is flaky, occasionally get error: \"dial tcp 127.0.0.1:59654: connect: connection reset by peer\"")
 
-	l := launcher.RunTestLauncherOrFail(t, ctx, nil,
-		"--log-level", "error",
-		"--query-queue-size", "1024",
-		"--query-concurrency", "1",
-		"--query-initial-memory-bytes", "10000",
-		"--query-memory-bytes", "50000",
-		"--query-max-memory-bytes", "200000",
-	)
+	l := launcher.RunTestLauncherOrFail(t, ctx, nil, func(o *launcher.InfluxdOpts) {
+		o.LogLevel = zap.ErrorLevel
+		o.QueueSize = 1024
+		o.ConcurrencyQuota = 1
+		o.InitialMemoryBytesQuotaPerQuery = 10000
+		o.MemoryBytesQuotaPerQuery = 50000
+		o.MaxMemoryBytes = 200000
+	})
 	l.SetupOrFail(t)
 	defer l.ShutdownOrFail(t, ctx)
 
@@ -751,14 +754,213 @@ from(bucket: "%s")
 	}
 }
 
+type TestQueryProfiler struct {
+	start int64
+}
+
+func (s TestQueryProfiler) Name() string {
+	return fmt.Sprintf("query%d", s.start)
+}
+
+func (s TestQueryProfiler) GetSortedResult(q flux.Query, alloc *memory.Allocator, desc bool, sortKeys ...string) (flux.Table, error) {
+	return nil, nil
+}
+
+func (s TestQueryProfiler) GetResult(q flux.Query, alloc *memory.Allocator) (flux.Table, error) {
+	groupKey := execute.NewGroupKey(
+		[]flux.ColMeta{
+			{
+				Label: "_measurement",
+				Type:  flux.TString,
+			},
+		},
+		[]values.Value{
+			values.NewString(fmt.Sprintf("profiler/query%d", s.start)),
+		},
+	)
+	b := execute.NewColListTableBuilder(groupKey, alloc)
+	colMeta := []flux.ColMeta{
+		{
+			Label: "_measurement",
+			Type:  flux.TString,
+		},
+		{
+			Label: "TotalDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "CompileDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "QueueDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "PlanDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "RequeueDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "ExecuteDuration",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "Concurrency",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "MaxAllocated",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "TotalAllocated",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "RuntimeErrors",
+			Type:  flux.TString,
+		},
+		{
+			Label: "influxdb/scanned-bytes",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "influxdb/scanned-values",
+			Type:  flux.TInt,
+		},
+		{
+			Label: "flux/query-plan",
+			Type:  flux.TString,
+		},
+	}
+	colData := []interface{}{
+		fmt.Sprintf("profiler/query%d", s.start),
+		s.start,
+		s.start + 1,
+		s.start + 2,
+		s.start + 3,
+		s.start + 4,
+		s.start + 5,
+		s.start + 6,
+		s.start + 7,
+		s.start + 8,
+		"error1\nerror2",
+		s.start + 9,
+		s.start + 10,
+		"query plan",
+	}
+	for _, col := range colMeta {
+		if _, err := b.AddCol(col); err != nil {
+			return nil, err
+		}
+	}
+	for i := 0; i < len(colData); i++ {
+		if intValue, ok := colData[i].(int64); ok {
+			b.AppendInt(i, intValue)
+		} else {
+			b.AppendString(i, colData[i].(string))
+		}
+	}
+	tbl, err := b.Table()
+	if err != nil {
+		return nil, err
+	}
+	return tbl, nil
+}
+
+func NewTestQueryProfiler0() execute.Profiler {
+	return &TestQueryProfiler{start: 0}
+}
+
+func NewTestQueryProfiler100() execute.Profiler {
+	return &TestQueryProfiler{start: 100}
+}
+
+func TestFluxProfiler(t *testing.T) {
+	testcases := []struct {
+		name  string
+		data  []string
+		query string
+		want  string
+	}{
+		{
+			name: "range last single point start time",
+			data: []string{
+				"m,tag=a f=1i 1",
+			},
+			query: `
+option profiler.enabledProfilers = ["query0", "query100", "query100", "NonExistentProfiler"]
+from(bucket: v.bucket)
+	|> range(start: 1970-01-01T00:00:00.000000001Z, stop: 1970-01-01T01:00:00Z)
+	|> last()
+`,
+			want: `
+#datatype,string,long,dateTime:RFC3339,dateTime:RFC3339,dateTime:RFC3339,long,string,string,string
+#group,false,false,true,true,false,false,true,true,true
+#default,_result,,,,,,,,
+,result,table,_start,_stop,_time,_value,_field,_measurement,tag
+,,0,1970-01-01T00:00:00.000000001Z,1970-01-01T01:00:00Z,1970-01-01T00:00:00.000000001Z,1,f,m,a
+
+#datatype,string,long,string,long,long,long,long,long,long,long,long,long,string,string,long,long
+#group,false,false,true,false,false,false,false,false,false,false,false,false,false,false,false,false
+#default,_profiler,,,,,,,,,,,,,,,
+,result,table,_measurement,TotalDuration,CompileDuration,QueueDuration,PlanDuration,RequeueDuration,ExecuteDuration,Concurrency,MaxAllocated,TotalAllocated,RuntimeErrors,flux/query-plan,influxdb/scanned-bytes,influxdb/scanned-values
+,,0,profiler/query0,0,1,2,3,4,5,6,7,8,"error1
+error2","query plan",9,10
+,,1,profiler/query100,100,101,102,103,104,105,106,107,108,"error1
+error2","query plan",109,110
+`,
+		},
+	}
+	execute.RegisterProfilerFactories(NewTestQueryProfiler0, NewTestQueryProfiler100)
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			l := launcher.RunTestLauncherOrFail(t, ctx, nil)
+
+			l.SetupOrFail(t)
+			defer l.ShutdownOrFail(t, ctx)
+
+			l.WritePointsOrFail(t, strings.Join(tc.data, "\n"))
+
+			queryStr := "import \"profiler\"\nv = {bucket: " + "\"" + l.Bucket.Name + "\"" + "}\n" + tc.query
+			req := &query.Request{
+				Authorization:  l.Auth,
+				OrganizationID: l.Org.ID,
+				Compiler: lang.FluxCompiler{
+					Query: queryStr,
+				},
+			}
+			if got, err := l.FluxQueryService().Query(ctx, req); err != nil {
+				t.Error(err)
+			} else {
+				dec := csv.NewMultiResultDecoder(csv.ResultDecoderConfig{})
+				want, err := dec.Decode(ioutil.NopCloser(strings.NewReader(tc.want)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer want.Release()
+
+				if err := executetest.EqualResultIterators(want, got); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestQueryPushDowns(t *testing.T) {
-	t.Skip("Not supported yet")
 	testcases := []struct {
 		name  string
 		data  []string
 		query string
 		op    string
 		want  string
+		skip  string
 	}{
 		{
 			name: "range last single point start time",
@@ -1982,6 +2184,7 @@ from(bucket: v.bucket)
 ,result,table,_time,_value
 ,,0,1970-01-01T00:00:00.00Z,0
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "group none first",
@@ -2018,6 +2221,7 @@ from(bucket: v.bucket)
 ,result,table,_time,_value
 ,,0,1970-01-01T00:00:00.00Z,0
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "group last",
@@ -2054,6 +2258,7 @@ from(bucket: v.bucket)
 ,result,table,_time,_value
 ,,0,1970-01-01T00:00:15.00Z,5
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "group none last",
@@ -2090,6 +2295,7 @@ from(bucket: v.bucket)
 ,result,table,_time,_value
 ,,0,1970-01-01T00:00:15.00Z,5
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "count group none",
@@ -2126,6 +2332,7 @@ from(bucket: v.bucket)
 ,result,table,_value
 ,,0,15
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "count group",
@@ -2163,6 +2370,7 @@ from(bucket: v.bucket)
 ,,0,kk0,8
 ,,1,kk1,7
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "sum group none",
@@ -2199,6 +2407,7 @@ from(bucket: v.bucket)
 ,result,table,_value
 ,,0,67
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "sum group",
@@ -2236,6 +2445,7 @@ from(bucket: v.bucket)
 ,,0,kk0,32
 ,,1,kk1,35
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "min group",
@@ -2273,6 +2483,7 @@ from(bucket: v.bucket)
 ,,0,kk0,0
 ,,1,kk1,1
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 		{
 			name: "max group",
@@ -2310,15 +2521,16 @@ from(bucket: v.bucket)
 ,,0,kk0,9
 ,,1,kk1,8
 `,
+			skip: "https://github.com/influxdata/idpe/issues/8828",
 		},
 	}
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			l := launcher.RunTestLauncherOrFail(t, ctx, mock.NewFlagger(map[feature.Flag]interface{}{
-				feature.PushDownWindowAggregateMean():  true,
-				feature.PushDownGroupAggregateMinMax(): true,
-			}))
+			if tc.skip != "" {
+				t.Skip(tc.skip)
+			}
+			l := launcher.RunTestLauncherOrFail(t, ctx, mock.NewFlagger(map[feature.Flag]interface{}{}))
 
 			l.SetupOrFail(t)
 			defer l.ShutdownOrFail(t, ctx)

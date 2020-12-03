@@ -126,7 +126,7 @@ jobs:
           destination: nightly-junit
   e2e:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     environment:
       GOCACHE: /tmp/go-cache
       GOFLAGS: "-mod=readonly -p=4" # Go on Circle thinks 32 CPUs are available, but there aren't.
@@ -210,9 +210,21 @@ jobs:
           path: ~/project
       - store_test_results:
           path: ~/project
+  grace_daily:
+    machine: true
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run: docker login -u=$QUAY_USER -p=$QUAY_PASS quay.io
+      - run:
+          command: ./bin/linux/influxd --store=memory --log-level=debug
+          background: true
+      - run: docker run --net host -v /var/run/docker.sock:/var/run/docker.sock -v ~/project:/grace/test-results/grace-results quay.io/influxdb/grace:daily
+      - store_artifacts:
+          path: ~/project
   jstest:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     working_directory: /go/src/github.com/influxdata/influxdb
     parallelism: 8
     steps:
@@ -248,7 +260,7 @@ jobs:
             - ~/.cache/yarn
   jslint:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     working_directory: /go/src/github.com/influxdata/influxdb
     parallelism: 8
     steps:
@@ -278,7 +290,7 @@ jobs:
             - ~/.cache/yarn
   gotest:
     docker:
-      - image: circleci/golang:1.13
+      - image: circleci/golang:1.15
     resource_class: large
     environment:
       GOCACHE: /tmp/go-cache
@@ -331,20 +343,9 @@ jobs:
       - store_test_results: # Upload test results for display in Test Summary: https://circleci.com/docs/2.0/collect-test-data/
           path: /tmp/test-results
 
-  lint-feature-flags:
-    docker:
-      - image: circleci/golang:1.13
-    environment:
-      GOCACHE: /tmp/go-cache
-      GOFLAGS: "-mod=readonly -p=2" # Go on Circle thinks 32 CPUs are available, but there aren't.
-    working_directory: /go/src/github.com/influxdata/influxdb
-    steps:
-      - checkout
-      - run: ./scripts/ci/lint/flags.bash
-
   golint:
     docker:
-      - image: circleci/golang:1.13
+      - image: circleci/golang:1.15
     environment:
       GOCACHE: /tmp/go-cache
       GOFLAGS: "-mod=readonly -p=2" # Go on Circle thinks 32 CPUs are available, but there aren't.
@@ -378,7 +379,7 @@ jobs:
           path: /tmp/test-results
   build:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     environment:
       GOCACHE: /tmp/go-cache
       GOFLAGS: "-mod=readonly -p=4" # Go on Circle thinks 32 CPUs are available, but there aren't.
@@ -410,7 +411,7 @@ jobs:
             - etc/litmus_fail_notify.sh
   deploy-nightly:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     environment:
       GOCACHE: /tmp/go-cache
       GOFLAGS: "-mod=readonly -p=4" # Go on Circle thinks 32 CPUs are available, but there aren't.
@@ -446,11 +447,11 @@ jobs:
 
   release:
     docker:
-      - image: circleci/golang:1.13-node-browsers
+      - image: circleci/golang:1.15-node-browsers
     environment:
       GOCACHE: /tmp/go-cache
       GOFLAGS: "-mod=readonly -p=4" # Go on Circle thinks 32 CPUs are available, but there aren't.
-      DOCKER_VERSION: 2.0.0-beta
+      DOCKER_VERSION: 2.0.0-rc
     working_directory: /go/src/github.com/influxdata/influxdb
     steps:
       - checkout
@@ -473,6 +474,11 @@ jobs:
       - install_release_tools
       - run: make protoc # installs protoc
       - run:
+          name: import GPG key
+          command: |
+            echo -e "$GPG_PRIVATE_KEY" > private.key
+            gpg --batch --import private.key
+      - run:
           name: "Build release"
           command: make release
 
@@ -482,10 +488,15 @@ workflows:
     jobs:
       - gotest
       - golint
-      - lint-feature-flags
       - jstest
       - jslint
       - build
+      - grace_daily:
+          requires:
+            - build
+          filters:
+            branches:
+              only: /^(?!pull\/).*$/
       - litmus_daily:
           requires:
             - build
@@ -523,14 +534,12 @@ workflows:
     jobs:
       - gotest
       - golint
-      - lint-feature-flags
       - jstest
       - jslint
       - deploy-nightly:
           requires:
             - gotest
             - golint
-            - lint-feature-flags
             - jstest
             - jslint
           filters:
@@ -540,9 +549,9 @@ workflows:
       - litmus_nightly:
           requires:
             - deploy-nightly
-      - selenium_accept:
-          requires:
-            - deploy-nightly
+      # - selenium_accept:
+      #    requires:
+      #      - deploy-nightly
       - grace_nightly:
           requires:
             - deploy-nightly
@@ -553,40 +562,33 @@ workflows:
             branches:
               ignore: /.*/
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
       - golint:
           filters:
             branches:
               ignore: /.*/
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
-      - lint-feature-flags:
-          filters:
-            branches:
-              ignore: /.*/
-            tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
       - jstest:
           filters:
             branches:
               ignore: /.*/
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
       - jslint:
           filters:
             branches:
               ignore: /.*/
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
       - release:
           requires:
             - gotest
             - golint
-            - lint-feature-flags
             - jstest
             - jslint
           filters:
             branches:
               ignore: /.*/
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)\.[0-9]+$/
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/

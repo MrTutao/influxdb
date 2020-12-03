@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"path/filepath"
 	"sync"
@@ -10,7 +11,6 @@ import (
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/influxql/query"
 	"github.com/influxdata/influxdb/v2/kit/tracing"
-	"github.com/influxdata/influxdb/v2/logger"
 	"github.com/influxdata/influxdb/v2/models"
 	"github.com/influxdata/influxdb/v2/tsdb"
 	_ "github.com/influxdata/influxdb/v2/tsdb/engine"
@@ -18,27 +18,23 @@ import (
 	_ "github.com/influxdata/influxdb/v2/tsdb/index/tsi1"
 	"github.com/influxdata/influxdb/v2/v1/coordinator"
 	"github.com/influxdata/influxdb/v2/v1/services/meta"
+	"github.com/influxdata/influxdb/v2/v1/services/precreator"
+	"github.com/influxdata/influxdb/v2/v1/services/retention"
 	"github.com/influxdata/influxql"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
-	"golang.org/x/time/rate"
 )
 
-// Static objects to prevent small allocs.
-// var timeBytes = []byte("time")
+var (
+	// ErrEngineClosed is returned when a caller attempts to use the engine while
+	// it's closed.
+	ErrEngineClosed = errors.New("engine is closed")
 
-// ErrEngineClosed is returned when a caller attempts to use the engine while
-// it's closed.
-var ErrEngineClosed = errors.New("engine is closed")
-
-// runner lets us mock out the retention enforcer in tests
-type runner interface{ run() }
-
-// runnable is a function that lets the caller know if they can proceed with their
-// task. A runnable returns a function that should be called by the caller to
-// signal they finished their task.
-type runnable func() (done func())
+	// ErrNotImplemented is returned for APIs that are temporarily not implemented.
+	ErrNotImplemented = errors.New("not implemented")
+)
 
 type Engine struct {
 	config Config
@@ -50,56 +46,21 @@ type Engine struct {
 	metaClient   MetaClient
 	pointsWriter interface {
 		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error
+		Close() error
 	}
-	finder BucketFinder
 
-	retentionEnforcer        runner
-	retentionEnforcerLimiter runnable
+	retentionService  *retention.Service
+	precreatorService *precreator.Service
 
 	defaultMetricLabels prometheus.Labels
 
 	writePointsValidationEnabled bool
-
-	// Tracks all goroutines started by the Engine.
-	wg sync.WaitGroup
 
 	logger *zap.Logger
 }
 
 // Option provides a set
 type Option func(*Engine)
-
-// WithRetentionEnforcer initialises a retention enforcer on the engine.
-// WithRetentionEnforcer must be called after other options to ensure that all
-// metrics are labelled correctly.
-func WithRetentionEnforcer(finder BucketFinder) Option {
-	return func(e *Engine) {
-		e.finder = finder
-		// TODO - change retention enforce to take store
-		// e.retentionEnforcer = newRetentionEnforcer(e, e.engine, finder)
-	}
-}
-
-// WithRetentionEnforcerLimiter sets a limiter used to control when the
-// retention enforcer can proceed. If this option is not used then the default
-// limiter (or the absence of one) is a no-op, and no limitations will be put
-// on running the retention enforcer.
-func WithRetentionEnforcerLimiter(f runnable) Option {
-	return func(e *Engine) {
-		e.retentionEnforcerLimiter = f
-	}
-}
-
-// WithPageFaultLimiter allows the caller to set the limiter for restricting
-// the frequency of page faults.
-func WithPageFaultLimiter(limiter *rate.Limiter) Option {
-	return func(e *Engine) {
-		// TODO no longer needed
-		// e.engine.WithPageFaultLimiter(limiter)
-		// e.index.WithPageFaultLimiter(limiter)
-		// e.sfile.WithPageFaultLimiter(limiter)
-	}
-}
 
 func WithMetaClient(c MetaClient) Option {
 	return func(e *Engine) {
@@ -108,15 +69,25 @@ func WithMetaClient(c MetaClient) Option {
 }
 
 type MetaClient interface {
-	Database(name string) (di *meta.DatabaseInfo)
 	CreateDatabaseWithRetentionPolicy(name string, spec *meta.RetentionPolicySpec) (*meta.DatabaseInfo, error)
-	UpdateRetentionPolicy(database, name string, rpu *meta.RetentionPolicyUpdate, makeDefault bool) error
-	RetentionPolicy(database, policy string) (*meta.RetentionPolicyInfo, error)
 	CreateShardGroup(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error)
+	Database(name string) (di *meta.DatabaseInfo)
+	Databases() []meta.DatabaseInfo
+	DeleteShardGroup(database, policy string, id uint64) error
+	PrecreateShardGroups(now, cutoff time.Time) error
+	PruneShardGroups() error
+	RetentionPolicy(database, policy string) (*meta.RetentionPolicyInfo, error)
 	ShardGroupsByTimeRange(database, policy string, min, max time.Time) (a []meta.ShardGroupInfo, err error)
+	UpdateRetentionPolicy(database, name string, rpu *meta.RetentionPolicyUpdate, makeDefault bool) error
+	Backup(ctx context.Context, w io.Writer) error
+	Restore(ctx context.Context, r io.Reader) error
+	Data() meta.Data
+	SetData(data *meta.Data) error
 }
 
 type TSDBStore interface {
+	DeleteMeasurement(database, name string) error
+	DeleteSeries(database string, sources []influxql.Source, condition influxql.Expr) error
 	MeasurementNames(auth query.Authorizer, database string, cond influxql.Expr) ([][]byte, error)
 	ShardGroup(ids []uint64) tsdb.ShardGroup
 	Shards(ids []uint64) []*tsdb.Shard
@@ -155,9 +126,12 @@ func NewEngine(path string, c Config, options ...Option) *Engine {
 	pw.MetaClient = e.metaClient
 	e.pointsWriter = pw
 
-	if r, ok := e.retentionEnforcer.(*retentionEnforcer); ok {
-		r.SetDefaultMetricLabels(e.defaultMetricLabels)
-	}
+	e.retentionService = retention.NewService(c.RetentionService)
+	e.retentionService.TSDBStore = e.tsdbStore
+	e.retentionService.MetaClient = e.metaClient
+
+	e.precreatorService = precreator.NewService(c.PrecreatorConfig)
+	e.precreatorService.MetaClient = e.metaClient
 
 	return e
 }
@@ -173,17 +147,19 @@ func (e *Engine) WithLogger(log *zap.Logger) {
 		pw.Logger = e.logger
 	}
 
-	if r, ok := e.retentionEnforcer.(*retentionEnforcer); ok {
-		r.WithLogger(e.logger)
+	if e.retentionService != nil {
+		e.retentionService.WithLogger(log)
+	}
+
+	if e.precreatorService != nil {
+		e.precreatorService.WithLogger(log)
 	}
 }
 
 // PrometheusCollectors returns all the prometheus collectors associated with
 // the engine and its components.
 func (e *Engine) PrometheusCollectors() []prometheus.Collector {
-	var metrics []prometheus.Collector
-	metrics = append(metrics, RetentionPrometheusCollectors()...)
-	return metrics
+	return nil
 }
 
 // Open opens the store and all underlying resources. It returns an error if
@@ -202,14 +178,17 @@ func (e *Engine) Open(ctx context.Context) (err error) {
 	if err := e.tsdbStore.Open(); err != nil {
 		return err
 	}
+
+	if err := e.retentionService.Open(ctx); err != nil {
+		return err
+	}
+
+	if err := e.precreatorService.Open(ctx); err != nil {
+		return err
+	}
+
 	e.closing = make(chan struct{})
 
-	// TODO(edd) background tasks will be run in priority order via a scheduler.
-	// For now we will just run on an interval as we only have the retention
-	// policy enforcer.
-	if e.retentionEnforcer != nil {
-		e.runRetentionEnforcer()
-	}
 	return nil
 }
 
@@ -219,72 +198,6 @@ func (e *Engine) EnableCompactions() {
 
 // DisableCompactions disables compactions in the series file, index, & engine.
 func (e *Engine) DisableCompactions() {
-}
-
-// runRetentionEnforcer runs the retention enforcer in a separate goroutine.
-//
-// Currently this just runs on an interval, but in the future we will add the
-// ability to reschedule the retention enforcement if there are not enough
-// resources available.
-func (e *Engine) runRetentionEnforcer() {
-	interval := time.Duration(e.config.RetentionInterval)
-
-	if interval == 0 {
-		e.logger.Info("Retention enforcer disabled")
-		return // Enforcer disabled.
-	} else if interval < 0 {
-		e.logger.Error("Negative retention interval", logger.DurationLiteral("check_interval", interval))
-		return
-	}
-
-	l := e.logger.With(zap.String("component", "retention_enforcer"), logger.DurationLiteral("check_interval", interval))
-	l.Info("Starting")
-
-	ticker := time.NewTicker(interval)
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		for {
-			// It's safe to read closing without a lock because it's never
-			// modified if this goroutine is active.
-			select {
-			case <-e.closing:
-				l.Info("Stopping")
-				return
-			case <-ticker.C:
-				// canRun will signal to this goroutine that the enforcer can
-				// run. It will also carry from the blocking goroutine a function
-				// that needs to be called when the enforcer has finished its work.
-				canRun := make(chan func())
-
-				// This goroutine blocks until the retention enforcer has permission
-				// to proceed.
-				go func() {
-					if e.retentionEnforcerLimiter != nil {
-						// The limiter will block until the enforcer can proceed.
-						// The limiter returns a function that needs to be called
-						// when the enforcer has finished its work.
-						canRun <- e.retentionEnforcerLimiter()
-						return
-					}
-					canRun <- func() {}
-				}()
-
-				// Is it possible to get a slot? We need to be able to close
-				// whilst waiting...
-				select {
-				case <-e.closing:
-					l.Info("Stopping")
-					return
-				case done := <-canRun:
-					e.retentionEnforcer.run()
-					if done != nil {
-						done()
-					}
-				}
-			}
-		}
-	}()
 }
 
 // Close closes the store and all underlying resources. It returns an error if
@@ -301,15 +214,27 @@ func (e *Engine) Close() error {
 	close(e.closing)
 	e.mu.RUnlock()
 
-	// Wait for any other goroutines to finish.
-	e.wg.Wait()
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.closing = nil
 
-	// TODO - Close tsdb store
-	return nil
+	var retErr error
+	if err := e.precreatorService.Close(); err != nil {
+		retErr = multierr.Append(retErr, fmt.Errorf("error closing shard precreator service: %w", err))
+	}
+
+	if err := e.retentionService.Close(); err != nil {
+		retErr = multierr.Append(retErr, fmt.Errorf("error closing retention service: %w", err))
+	}
+
+	if err := e.tsdbStore.Close(); err != nil {
+		retErr = multierr.Append(retErr, fmt.Errorf("error closing TSDB store: %w", err))
+	}
+
+	if err := e.pointsWriter.Close(); err != nil {
+		retErr = multierr.Append(retErr, fmt.Errorf("error closing points writer: %w", err))
+	}
+	return retErr
 }
 
 // WritePoints writes the provided points to the engine.
@@ -325,7 +250,6 @@ func (e *Engine) WritePoints(ctx context.Context, orgID influxdb.ID, bucketID in
 	defer span.Finish()
 
 	//TODO - remember to add back unicode validation...
-	//TODO - remember to check that there is a _field key / \xff key added.
 
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -353,13 +277,18 @@ func (e *Engine) CreateBucket(ctx context.Context, b *influxdb.Bucket) (err erro
 	return nil
 }
 
-func (e *Engine) UpdateBucketRetentionPeriod(ctx context.Context, bucketID influxdb.ID, d time.Duration) (err error) {
+func (e *Engine) UpdateBucketRetentionPeriod(ctx context.Context, bucketID influxdb.ID, d time.Duration) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
+	// A value of zero ensures the ShardGroupDuration is adjusted to an appropriate value based on the specified
+	//   duration
+	zero := time.Duration(0)
 	rpu := meta.RetentionPolicyUpdate{
-		Duration: &d,
+		Duration:           &d,
+		ShardGroupDuration: &zero,
 	}
+
 	return e.metaClient.UpdateRetentionPolicy(bucketID.String(), meta.DefaultRetentionPolicyName, &rpu, true)
 }
 
@@ -367,22 +296,7 @@ func (e *Engine) UpdateBucketRetentionPeriod(ctx context.Context, bucketID influ
 func (e *Engine) DeleteBucket(ctx context.Context, orgID, bucketID influxdb.ID) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
-	return e.tsdbStore.DeleteRetentionPolicy(bucketID.String(), meta.DefaultRetentionPolicyName)
-}
-
-// DeleteBucketRange deletes an entire range of data from the storage engine.
-func (e *Engine) DeleteBucketRange(ctx context.Context, orgID, bucketID influxdb.ID, min, max int64) error {
-	span, _ := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.closing == nil {
-		return ErrEngineClosed
-	}
-
-	// TODO(edd): create an influxql.Expr that represents the min and max time...
-	return e.tsdbStore.DeleteSeries(bucketID.String(), nil, nil)
+	return e.tsdbStore.DeleteDatabase(bucketID.String())
 }
 
 // DeleteBucketRangePredicate deletes data within a bucket from the storage engine. Any data
@@ -396,57 +310,151 @@ func (e *Engine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID
 	if e.closing == nil {
 		return ErrEngineClosed
 	}
-
-	var predData []byte
-	var err error
-	if pred != nil {
-		// Marshal the predicate to add it to the WAL.
-		predData, err = pred.Marshal()
-		if err != nil {
-			return err
-		}
-	}
-	_ = predData
-
-	// TODO - edd convert the predicate into an influxql.Expr
-	return e.tsdbStore.DeleteSeries(bucketID.String(), nil, nil)
+	return e.tsdbStore.DeleteSeriesWithPredicate(bucketID.String(), min, max, pred)
 }
 
-// CreateBackup creates a "snapshot" of all TSM data in the Engine.
-//   1) Snapshot the cache to ensure the backup includes all data written before now.
-//   2) Create hard links to all TSM files, in a new directory within the engine root directory.
-//   3) Return a unique backup ID (invalid after the process terminates) and list of files.
-//
-// TODO - do we need this?
-//
-func (e *Engine) CreateBackup(ctx context.Context) (int, []string, error) {
+func (e *Engine) BackupKVStore(ctx context.Context, w io.Writer) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	if e.closing == nil {
-		return 0, nil, ErrEngineClosed
+		return ErrEngineClosed
 	}
 
-	return 0, nil, nil
+	return e.metaClient.Backup(ctx, w)
 }
 
-// FetchBackupFile writes a given backup file to the provided writer.
-// After a successful write, the internal copy is removed.
-func (e *Engine) FetchBackupFile(ctx context.Context, backupID int, backupFile string, w io.Writer) error {
-	// TODO - need?
+func (e *Engine) BackupShard(ctx context.Context, w io.Writer, shardID uint64, since time.Time) error {
+	span, _ := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.closing == nil {
+		return ErrEngineClosed
+	}
+
+	return e.tsdbStore.BackupShard(shardID, since, w)
+}
+
+func (e *Engine) RestoreKVStore(ctx context.Context, r io.Reader) error {
+	span, _ := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.closing == nil {
+		return ErrEngineClosed
+	}
+
+	// Replace KV store data and remove all existing shard data.
+	if err := e.metaClient.Restore(ctx, r); err != nil {
+		return err
+	} else if err := e.tsdbStore.DeleteShards(); err != nil {
+		return err
+	}
+
+	// Create new shards based on the restored KV data.
+	data := e.metaClient.Data()
+	for _, dbi := range data.Databases {
+		for _, rpi := range dbi.RetentionPolicies {
+			for _, sgi := range rpi.ShardGroups {
+				if sgi.Deleted() {
+					continue
+				}
+
+				for _, sh := range sgi.Shards {
+					if err := e.tsdbStore.CreateShard(dbi.Name, rpi.Name, sh.ID, true); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
-// InternalBackupPath provides the internal, full path directory name of the backup.
-// This should not be exposed via API.
-func (e *Engine) InternalBackupPath(backupID int) string {
+func (e *Engine) RestoreBucket(ctx context.Context, id influxdb.ID, buf []byte) (map[uint64]uint64, error) {
+	span, _ := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
 	if e.closing == nil {
-		return ""
+		return nil, ErrEngineClosed
 	}
-	// TODO - need?
-	return ""
+
+	var newDBI meta.DatabaseInfo
+	if err := newDBI.UnmarshalBinary(buf); err != nil {
+		return nil, err
+	}
+
+	data := e.metaClient.Data()
+	dbi := data.Database(id.String())
+	if dbi == nil {
+		return nil, fmt.Errorf("bucket dbi for %q not found during restore", newDBI.Name)
+	} else if len(newDBI.RetentionPolicies) != 1 {
+		return nil, fmt.Errorf("bucket must have 1 retention policy; attempting to restore %d retention policies", len(newDBI.RetentionPolicies))
+	}
+
+	dbi.RetentionPolicies = newDBI.RetentionPolicies
+	dbi.ContinuousQueries = newDBI.ContinuousQueries
+
+	// Generate shard ID mapping.
+	shardIDMap := make(map[uint64]uint64)
+	rpi := newDBI.RetentionPolicies[0]
+	for j, sgi := range rpi.ShardGroups {
+		data.MaxShardGroupID++
+		rpi.ShardGroups[j].ID = data.MaxShardGroupID
+
+		for k := range sgi.Shards {
+			data.MaxShardID++
+			shardIDMap[sgi.Shards[k].ID] = data.MaxShardID
+			sgi.Shards[k].ID = data.MaxShardID
+			sgi.Shards[k].Owners = []meta.ShardOwner{}
+		}
+	}
+
+	// Update data.
+	if err := e.metaClient.SetData(&data); err != nil {
+		return nil, err
+	}
+
+	// Create shards.
+	for _, sgi := range rpi.ShardGroups {
+		if sgi.Deleted() {
+			continue
+		}
+
+		for _, sh := range sgi.Shards {
+			if err := e.tsdbStore.CreateShard(dbi.Name, rpi.Name, sh.ID, true); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return shardIDMap, nil
+}
+
+func (e *Engine) RestoreShard(ctx context.Context, shardID uint64, r io.Reader) error {
+	span, _ := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.closing == nil {
+		return ErrEngineClosed
+	}
+
+	return e.tsdbStore.RestoreShard(shardID, r)
 }
 
 // SeriesCardinality returns the number of series in the engine.
